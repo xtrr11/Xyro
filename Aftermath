@@ -809,6 +809,7 @@ do
 	UI.checkbox(o, "Vehicle ESP", { swatch = PALETTE[4] })
 	UI.checkbox(o, "Container ESP", { swatch = WHITE })
 	UI.slider(o, "Text Size", 8, 24, 13)
+	UI.button(o, "Dump Nearby Models")
 
 	local e = UI.section(c3, "Extras")
 	UI.checkbox(e, "Crosshair", { swatch = WHITE })
@@ -1252,33 +1253,26 @@ local function toMeters(studs)
 	return math.max(0, math.floor(studs * STUD_TO_M + 0.5))
 end
 
+-- Cheap 2-point box (head + feet). Full 8-corner scan was killing FPS.
 local function bodyScreenBox(model)
-	local minX, minY = math.huge, math.huge
-	local maxX, maxY = -math.huge, -math.huge
-	local any = false
-	for _, p in ipairs(model:GetChildren()) do
-		if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" and p.Name ~= "ServerCollider" and p.Name ~= "Part" then
-			local cf, s = p.CFrame, p.Size * 0.5
-			local corners = {
-				cf * Vector3.new(s.X, s.Y, s.Z), cf * Vector3.new(-s.X, s.Y, s.Z),
-				cf * Vector3.new(s.X, -s.Y, s.Z), cf * Vector3.new(-s.X, -s.Y, s.Z),
-				cf * Vector3.new(s.X, s.Y, -s.Z), cf * Vector3.new(-s.X, s.Y, -s.Z),
-				cf * Vector3.new(s.X, -s.Y, -s.Z), cf * Vector3.new(-s.X, -s.Y, -s.Z),
-			}
-			for _, corner in ipairs(corners) do
-				local sp = worldToScreen(corner)
-				if sp then
-					any = true
-					if sp.X < minX then minX = sp.X end
-					if sp.Y < minY then minY = sp.Y end
-					if sp.X > maxX then maxX = sp.X end
-					if sp.Y > maxY then maxY = sp.Y end
-				end
-			end
-		end
+	local head = model:FindFirstChild("Head") or model:FindFirstChild("UpperTorso")
+	local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+		or model:FindFirstChild("LowerTorso") or model.PrimaryPart
+	if not root or not root:IsA("BasePart") then
+		root = model:FindFirstChildWhichIsA("BasePart")
 	end
-	if not any then return end
-	return minX, minY, math.max(maxX - minX, 8), math.max(maxY - minY, 8)
+	if not root then return end
+	local topPos = (head and head:IsA("BasePart") and head.Position + Vector3.new(0, 0.9, 0))
+		or (root.Position + Vector3.new(0, 2.6, 0))
+	local botPos = root.Position - Vector3.new(0, math.max(root.Size.Y * 0.5, 2.2), 0)
+	local top = worldToScreen(topPos)
+	local bot = worldToScreen(botPos)
+	if not top or not bot then return end
+	local h = math.max(math.abs(bot.Y - top.Y), 10)
+	local w = math.clamp(h * 0.48, 10, 90)
+	local x = (top.X + bot.X) * 0.5 - w * 0.5
+	local y = math.min(top.Y, bot.Y)
+	return x, y, w, h
 end
 
 -- toasts (not part of the menu)
@@ -1364,6 +1358,50 @@ local function myBody()
 	end
 end
 
+-- The rig this camera is standing inside. Used by anti-aim, not by spectate checks.
+local function ownBody()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local origin = cam.CFrame.Position
+	local best, bestPart, bestD
+	local function consider(model)
+		if not model or not model:IsA("Model") then return end
+		if model.Name == "PlayerGrave" or model.Name == "CurrentWeapon" then return end
+		local part = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+			or model:FindFirstChild("UpperTorso") or model:FindFirstChild("ServerCollider")
+			or model:FindFirstChild("Head") or model.PrimaryPart
+		if part and part:IsA("BasePart") then
+			local d = (part.Position - origin).Magnitude
+			if d < 12 and (not bestD or d < bestD) then
+				best, bestPart, bestD = model, part, d
+			end
+		end
+	end
+	local assets = workspace:FindFirstChild("game_assets")
+	local entities = assets and assets:FindFirstChild("Entities")
+	if entities then
+		for _, m in ipairs(entities:GetChildren()) do consider(m) end
+	end
+	if lp.Character then consider(lp.Character) end
+	for _, m in ipairs(cam:GetChildren()) do consider(m) end
+	local default = workspace:FindFirstChild("Default")
+	if default then
+		for _, d in ipairs(default:GetChildren()) do
+			if d:IsA("Model") then
+				consider(d)
+			elseif d:IsA("Folder") and d.Name ~= "PlayerGrave" then
+				for _, m in ipairs(d:GetChildren()) do consider(m) end
+			end
+		end
+	end
+	if best then return best, bestPart end
+	local rep = cam:FindFirstChild("ReplicationPart_" .. tostring(lp.UserId), true)
+	if rep and rep:IsA("BasePart") then
+		local model = rep:FindFirstAncestorOfClass("Model")
+		if model and model ~= cam then return model, rep end
+	end
+end
+
 local function myChar()
 	local model, root, view = localEntity()
 	local c = lp.Character or model or view
@@ -1388,20 +1426,63 @@ local function blobOf(model)
 end
 
 local function playerOf(model)
+	if not model then return end
 	local plr = Players:GetPlayerFromCharacter(model)
-	if plr then return plr end
-	local attr = model:GetAttribute("UserId") or model:GetAttribute("PlayerId") or model:GetAttribute("OwnerId")
-	if typeof(attr) == "number" then
-		return Players:GetPlayerByUserId(attr)
+	if plr and plr ~= lp then return plr end
+	-- attributes
+	for _, key in ipairs({ "UserId", "PlayerId", "OwnerId", "userId", "playerId", "ownerId", "Uid", "UID" }) do
+		local attr = model:GetAttribute(key)
+		if typeof(attr) == "number" and attr > 0 then
+			local p = Players:GetPlayerByUserId(attr)
+			if p and p ~= lp then return p end
+		elseif typeof(attr) == "string" then
+			local n = tonumber(attr)
+			if n and n > 0 then
+				local p = Players:GetPlayerByUserId(n)
+				if p and p ~= lp then return p end
+			end
+			local byName = Players:FindFirstChild(attr)
+			if byName and byName:IsA("Player") and byName ~= lp then return byName end
+		end
 	end
-	if typeof(attr) == "string" then
-		local n = tonumber(attr)
-		if n then return Players:GetPlayerByUserId(n) end
-		local byName = Players:FindFirstChild(attr)
-		if byName and byName:IsA("Player") then return byName end
+	-- NumberValues / IntValues / StringValues that look like a user id
+	for _, d in ipairs(model:GetChildren()) do
+		if d:IsA("NumberValue") or d:IsA("IntValue") then
+			local n = d.Name:lower()
+			if (n:find("user", 1, true) or n:find("owner", 1, true) or n:find("player", 1, true) or n == "uid" or n == "id")
+				and type(d.Value) == "number" and d.Value > 0 then
+				local p = Players:GetPlayerByUserId(d.Value)
+				if p and p ~= lp then return p end
+			end
+		elseif d:IsA("StringValue") then
+			local n = d.Name:lower()
+			if n:find("name", 1, true) or n:find("user", 1, true) or n:find("owner", 1, true) then
+				local p = Players:FindFirstChild(d.Value)
+				if p and p:IsA("Player") and p ~= lp then return p end
+			end
+		end
 	end
+	-- model name is a player name
 	local byModel = Players:FindFirstChild(model.Name)
-	if byModel and byModel:IsA("Player") then return byModel end
+	if byModel and byModel:IsA("Player") and byModel ~= lp then return byModel end
+	-- ReplicationPart_USERID under camera
+	local cam = workspace.CurrentCamera
+	if cam then
+		for _, d in ipairs(cam:GetDescendants()) do
+			if d:IsA("BasePart") then
+				local uid = tostring(d.Name):match("ReplicationPart_(%d+)")
+				if uid then
+					local p = Players:GetPlayerByUserId(tonumber(uid))
+					if p and p ~= lp then
+						local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model.PrimaryPart
+						if root and (root.Position - d.Position).Magnitude < 18 then
+							return p
+						end
+					end
+				end
+			end
+		end
+	end
 end
 
 local function findPart(model, patterns)
@@ -1627,22 +1708,81 @@ end
 
 local function labelOf(plr, uid)
 	uid = tonumber(uid) or (typeof(plr) == "Instance" and plr:IsA("Player") and plr.UserId)
-	if uid and type(nameCache[uid]) == "string" and nameCache[uid] ~= "" then
+	if uid and type(nameCache[uid]) == "string" and nameCache[uid] ~= "" and nameCache[uid] ~= "Player" and nameCache[uid] ~= "..." then
 		return nameCache[uid]
 	end
 	if typeof(plr) == "Instance" and plr:IsA("Player") and plr ~= lp then
-		if plr.Name ~= "" and plr.Name ~= "Player" then
-			if plr.UserId then nameCache[plr.UserId] = plr.Name end
+		-- Prefer real username, then DisplayName
+		if plr.Name and plr.Name ~= "" and plr.Name ~= "Player" and not plr.Name:match("^Player%d+$") then
+			nameCache[plr.UserId] = plr.Name
 			return plr.Name
 		end
-		if plr.DisplayName ~= "" and plr.DisplayName ~= "Player" then
+		if plr.DisplayName and plr.DisplayName ~= "" and plr.DisplayName ~= "Player" then
+			nameCache[plr.UserId] = plr.DisplayName
 			return plr.DisplayName
+		end
+		if plr.Name and plr.Name ~= "" then
+			return plr.Name
 		end
 	end
 	if uid then
 		local name = resolveUser(uid)
-		if type(name) == "string" and name ~= "" then return name end
+		if type(name) == "string" and name ~= "" and name ~= "Player" then
+			nameCache[uid] = name
+			return name
+		end
 	end
+end
+
+local heldCache = setmetatable({}, { __mode = "k" })
+local function heldWeapon(model)
+	if not model then return end
+	local cached = heldCache[model]
+	if cached and (os.clock() - cached[2]) < 0.6 then
+		return cached[1]
+	end
+	local found
+	local tool = model:FindFirstChildOfClass("Tool")
+	if tool and tool.Name ~= "" and tool.Name ~= "Tool" then
+		found = tool.Name
+	end
+	if not found then
+		for _, d in ipairs(model:GetChildren()) do
+			if d:IsA("Tool") and d.Name ~= "" and d.Name ~= "Tool" then
+				found = d.Name
+				break
+			end
+		end
+	end
+	if not found then
+		for _, name in ipairs({ "Weapon", "Gun", "Equipped", "Primary" }) do
+			local obj = model:FindFirstChild(name)
+			if obj then
+				if (obj:IsA("StringValue") or obj:IsA("StringValue")) and type(obj.Value) == "string" and obj.Value ~= "" then
+					found = obj.Value
+					break
+				elseif (obj:IsA("Model") or obj:IsA("Tool")) and obj.Name ~= name and #obj.Name < 32 then
+					found = obj.Name
+					break
+				end
+			end
+		end
+	end
+	if not found then
+		for _, d in ipairs(model:GetChildren()) do
+			local n = d.Name:lower()
+			if (d:IsA("Model") or d:IsA("Tool")) and (
+				n:find("ak", 1, true) or n:find("m4", 1, true) or n:find("sks", 1, true)
+				or n:find("svd", 1, true) or n:find("pistol", 1, true) or n:find("rifle", 1, true)
+				or n:find("gun", 1, true) or n:find("mp5", 1, true) or n:find("glock", 1, true)
+			) then
+				found = d.Name
+				break
+			end
+		end
+	end
+	heldCache[model] = { found, os.clock() }
+	return found
 end
 
 task.spawn(function()
@@ -1708,27 +1848,84 @@ local function considerHuman(model, force, plrOverride)
 		}
 	end
 	local blob = blobOf(model)
+	local uid = plr and plr.UserId
+	if not uid then
+		local attr = model:GetAttribute("UserId") or model:GetAttribute("PlayerId") or model:GetAttribute("OwnerId")
+		uid = tonumber(attr)
+	end
+	if not uid then
+		for _, d in ipairs(model:GetChildren()) do
+			if (d:IsA("NumberValue") or d:IsA("IntValue")) then
+				local n = d.Name:lower()
+				if (n:find("user", 1, true) or n:find("owner", 1, true) or n == "uid") and d.Value > 1000 then
+					uid = d.Value
+					break
+				end
+			end
+		end
+	end
+	if uid and not plr then
+		plr = Players:GetPlayerByUserId(uid)
+		if uid then task.spawn(resolveUser, uid) end
+	end
+	if plr and plr.UserId then
+		task.spawn(function() labelOf(plr, plr.UserId) end)
+	end
 	humans[model] = {
-		model = model, hum = hum, root = root, plr = plr,
+		model = model, hum = hum, root = root, plr = plr, uid = uid,
 		chinese = (not plr) and isChinese(model, blob) or false,
 		blob = blob,
+		name = plr and labelOf(plr, plr.UserId) or nil,
 	}
 end
 
 local OBJ_WORDS = {
 	item = { "ammo", "medkit", "bandage", "food", "mre", "water", "magazine", "grenade", "floppy", "armor", "vest", "helmet", "backpack", "rucksack", "daypack" },
-	vehicle = {},
+	vehicle = { "vehicle", "uaz", "truck", "boat", "heli", "buggy", "atv", "jeep", "van", "pickup" },
 	container = { "crate", "cache", "locker", "cabinet", "container", "cooler", "drawer", "safe", "ammobox", "supply", "chest", "box" },
 }
 
+local BAD_WORLD = {
+	"worldmodel", "interior", "apartment", "building", "house", "room", "wall", "floor", "ceiling",
+	"static", "lod", "prop", "decal", "terrain", "foliage", "tree", "grass", "rock", "cliff",
+	"road", "path", "fence", "gate", "doorframe", "window", "light", "lamp", "sign", "poster",
+	"billboard", "scaffold", "construction", "repair", "workshop", "garage", "shed", "barn",
+	"crate_static", "pallet", "barrel_static", "pipe", "wire", "cable", "conduit", "vent",
+	"hvac", "duct", "railing", "stair", "ladder", "beam", "pillar", "column", "foundation",
+}
+
+local function isBadWorld(n)
+	n = string.lower(n or "")
+	for _, w in ipairs(BAD_WORLD) do
+		if n:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+local function vehicleName(n)
+	n = string.lower(n or "")
+	if n:find("zombie", 1, true) or isBadWorld(n) then return false end
+	local words = { "vehicle", "uaz", "truck", "boat", "heli", "buggy", "atv", "jeep", "humvee", "pickup", "lada", "sedan", "motorcycle" }
+	for _, w in ipairs(words) do
+		if n:find(w, 1, true) then return true end
+	end
+	if n:find("car", 1, true) and not n:find("card", 1, true) and not n:find("cargo", 1, true)
+		and not n:find("carrot", 1, true) and not n:find("cartoon", 1, true) and not n:find("repair", 1, true) then
+		return true
+	end
+	return false
+end
+
 local function isWreck(inst)
 	local node = inst
-	for _ = 1, 3 do
+	for _ = 1, 5 do
 		if not node then break end
 		local n = node.Name:lower()
 		if n:find("wreck", 1, true) or n:find("broken", 1, true) or n:find("destroyed", 1, true)
 			or n:find("ruin", 1, true) or n:find("husk", 1, true) or n:find("burnt", 1, true)
-			or n:find("abandoned", 1, true) or n:find("scrap", 1, true) or n:find("debris", 1, true) then
+			or n:find("abandoned", 1, true) or n:find("scrap", 1, true) or n:find("debris", 1, true)
+			or n:find("junk", 1, true) or n:find("junkvehicle", 1, true) or n:find("prop", 1, true)
+			or isBadWorld(n) then
 			return true
 		end
 		node = node.Parent
@@ -1739,28 +1936,46 @@ end
 local function tagObject(inst)
 	if not inst or inst == lp.Character then return end
 	local n = inst.Name:lower()
+	if isBadWorld(n) or n:find("worldmodel", 1, true) or n:find("interior", 1, true) then return end
 	local kind
+	-- Vehicles: seat, or clear vehicle name + (seat or wheels)
 	if inst:IsA("VehicleSeat") or inst:FindFirstChildWhichIsA("VehicleSeat", true) then
-		if isWreck(inst) then return end
-		kind = "vehicle"
+		if not isWreck(inst) then kind = "vehicle" end
+	elseif vehicleName(n) and not isWreck(inst) then
+		if inst:FindFirstChildWhichIsA("VehicleSeat", true)
+			or inst:FindFirstChild("Wheel", true)
+			or inst:FindFirstChild("Tire", true)
+			or inst:FindFirstChildWhichIsA("Wheel", true)
+			or n:find("uaz", 1, true) or n:find("buggy", 1, true) or n:find("jeep", 1, true) then
+			kind = "vehicle"
+		end
 	end
-	for k, words in pairs(OBJ_WORDS) do
-		if not kind then
+	if not kind then
+		for k, words in pairs(OBJ_WORDS) do
 			for _, w in ipairs(words) do
-				if n:find(w, 1, true) then kind = k break end
+				if n:find(w, 1, true) then
+					-- extra safety: never tag pure world geometry as container/item
+					if k == "container" and (n:find("world", 1, true) or n:find("static", 1, true)) then
+						break
+					end
+					kind = k
+					break
+				end
 			end
+			if kind then break end
 		end
 	end
 	if not kind and inst:IsA("Tool") then kind = "item" end
 	if not kind and inst:IsA("ProximityPrompt") then
 		local act = ((inst.ActionText or "") .. " " .. (inst.ObjectText or "")):lower()
 		local model = inst:FindFirstAncestorOfClass("Model")
-		if model and not model:FindFirstChildWhichIsA("Humanoid", true) then
-			if act:find("open", 1, true) or act:find("search", 1, true) or act:find("loot", 1, true) then
+		if model and not model:FindFirstChildWhichIsA("Humanoid", true) and not isBadWorld(model.Name) then
+			if act:find("drive", 1, true) or act:find("pilot", 1, true) or act:find("mount", 1, true) then
+				kind = "vehicle"
+			elseif act:find("open", 1, true) or act:find("search", 1, true) or act:find("loot", 1, true) or act:find("take", 1, true) then
 				kind = "container"
-			else
-				kind = "item"
 			end
+			-- removed the "else kind = item" that was tagging random props
 			inst = model
 		end
 	end
@@ -1769,6 +1984,7 @@ local function tagObject(inst)
 		inst = inst:FindFirstAncestorOfClass("Model")
 		if not inst then return end
 	end
+	if isWreck(inst) or isBadWorld(inst.Name) then return end
 	if inst:IsA("Model") and inst:FindFirstChildOfClass("Humanoid") then return end
 	local part = inst:IsA("BasePart") and inst or inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
 	if not part and inst:IsA("Model") then
@@ -2001,7 +2217,7 @@ local function rescan()
 		end
 	end
 	local function look(root, depth)
-		if not root or depth > 3 then return end
+		if not root or depth > 6 then return end
 		for _, d in ipairs(root:GetChildren()) do
 			local n = d.Name:lower()
 			if d:IsA("VehicleSeat") then
@@ -2009,11 +2225,9 @@ local function rescan()
 			elseif n:find("grave", 1, true) or n:find("bodybag", 1, true) or n:find("corpse", 1, true) or n:find("tomb", 1, true) then
 				local host = d:IsA("Model") and d or (d.Parent and d.Parent:IsA("Model") and d.Parent)
 				if host and host ~= workspace then tagWorld(host, "grave", "Grave") end
-			elseif n:find("car", 1, true) or n:find("truck", 1, true) or n:find("vehicle", 1, true) or n:find("uaz", 1, true) or n:find("boat", 1, true) or n:find("heli", 1, true) then
-				if not n:find("zombie", 1, true) then
-					tagWorld(d:IsA("Model") and d or d:FindFirstAncestorOfClass("Model"), "vehicle")
-				end
-			elseif depth < 2 and (d:IsA("Folder") or d:IsA("Model")) and n ~= "trees" and n ~= "terrain" and n ~= "entities" then
+			elseif vehicleName(n) then
+				tagWorld(d:IsA("Model") and d or d:FindFirstAncestorOfClass("Model"), "vehicle")
+			elseif depth < 5 and (d:IsA("Folder") or d:IsA("Model")) and n ~= "trees" and n ~= "terrain" and n ~= "entities" then
 				look(d, depth + 1)
 			end
 		end
@@ -2026,18 +2240,38 @@ local function rescan()
 		for _, g in ipairs(graveFolder:GetChildren()) do
 			local label = g.Name
 			local function read(inst, depth)
-				if depth > 3 then return end
+				if depth > 4 then return end
 				for _, c in ipairs(inst:GetChildren()) do
-					if (c:IsA("StringValue") or c:IsA("TextLabel")) and tostring(c:IsA("StringValue") and c.Value or c.Text) ~= "" then
+					if c:IsA("StringValue") or c:IsA("TextLabel") or c:IsA("TextBox") then
 						local text = c:IsA("StringValue") and c.Value or c.Text
-						if text and text ~= "" then label = text end
+						if type(text) == "string" and text ~= "" and text ~= "Player" and #text < 40 then
+							label = text
+						end
+					elseif c:IsA("NumberValue") or c:IsA("IntValue") then
+						local n = c.Name:lower()
+						if (n:find("user", 1, true) or n == "uid") and c.Value > 1000 then
+							local resolved = labelOf(nil, c.Value)
+							if resolved and resolved ~= "" then label = resolved end
+						end
 					end
-					if c:IsA("Folder") or c:IsA("Model") or c:IsA("Configuration") then
+					if c:IsA("Folder") or c:IsA("Model") or c:IsA("Configuration") or c:IsA("BillboardGui") then
 						read(c, depth + 1)
 					end
 				end
 			end
 			pcall(read, g, 0)
+			-- try match against player list by name fragment
+			if label == g.Name or label == "" or label == "Player" then
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if plr ~= lp then
+						local low = (g.Name .. " " .. label):lower()
+						if low:find(plr.Name:lower(), 1, true) or low:find(plr.DisplayName:lower(), 1, true) then
+							label = labelOf(plr, plr.UserId) or plr.Name
+							break
+						end
+					end
+				end
+			end
 			graves[g] = label
 		end
 	end
@@ -2066,16 +2300,26 @@ task.spawn(function()
 		while gui.Parent and #stack > 0 do
 			local inst = table.remove(stack)
 			local name = inst.Name
-			if name ~= "Trees" and name ~= "Terrain" then
-				if inst:IsA("VehicleSeat") or inst:IsA("Seat") then
-					local model = inst:FindFirstAncestorOfClass("Model") or inst
-					if not isWreck(model) then
-						worldObjs[model] = { inst = model, part = inst, kind = "vehicle" }
+			local low = name:lower()
+			if name ~= "Trees" and name ~= "Terrain" and not isBadWorld(name) and not low:find("worldmodel", 1, true) then
+				local drivePrompt = false
+				if inst:IsA("ProximityPrompt") then
+					local act = ((inst.ActionText or "") .. " " .. (inst.ObjectText or "")):lower()
+					drivePrompt = act:find("drive", 1, true) or act:find("pilot", 1, true) or act:find("mount", 1, true)
+				end
+				local looksVehicle = inst:IsA("VehicleSeat") or drivePrompt
+					or (inst:IsA("Model") and vehicleName(name) and (inst:FindFirstChildWhichIsA("VehicleSeat", true) or inst:FindFirstChild("Wheel", true) or inst:FindFirstChildWhichIsA("Wheel", true) or inst:FindFirstChild("Tire", true)))
+				if looksVehicle then
+					local model = inst:IsA("Model") and inst or inst:FindFirstAncestorOfClass("Model") or inst
+					if model and not isWreck(model) and not isBadWorld(model.Name) then
+						local part = inst:IsA("BasePart") and inst or model:FindFirstChildWhichIsA("BasePart", true)
+						if part then
+							worldObjs[model] = { inst = model, part = part, kind = "vehicle" }
+						end
 					end
 				elseif inst:IsA("ProximityPrompt") then
 					tagObject(inst)
-				elseif inst:IsA("Model") then
-					local low = name:lower()
+				elseif inst:IsA("Model") and not isBadWorld(name) then
 					local grave = low:find("grave", 1, true) or low:find("bodybag", 1, true) or low:find("corpse", 1, true) or low:find("tomb", 1, true)
 					if grave then
 						for _, plr in ipairs(Players:GetPlayers()) do
@@ -2084,28 +2328,30 @@ task.spawn(function()
 								break
 							end
 						end
-					elseif low:find("crate", 1, true) or low:find("locker", 1, true) or low:find("container", 1, true) or low:find("ammobox", 1, true) then
+					elseif low:find("crate", 1, true) or low:find("locker", 1, true) or low:find("ammobox", 1, true) or low:find("supply", 1, true) then
 						local part = inst:FindFirstChildWhichIsA("BasePart")
-						if part then worldObjs[inst] = { inst = inst, part = part, kind = "container" } end
+						if part and not isWreck(inst) then
+							worldObjs[inst] = { inst = inst, part = part, kind = "container" }
+						end
 					end
 				end
-				if not inst:IsA("BasePart") then
+				if not inst:IsA("BasePart") and n < 4000 then
 					for _, c in ipairs(inst:GetChildren()) do
 						table.insert(stack, c)
 					end
 				end
 			end
 			n += 1
-			if n % 250 == 0 then task.wait() end
+			if n % 300 == 0 then task.wait() end
 		end
-		task.wait(5)
+		task.wait(6)
 	end
 end)
 
 task.spawn(function()
 	while gui.Parent do
 		pcall(rescan)
-		task.wait(0.8)
+		task.wait(0.35)
 	end
 end)
 
@@ -2122,9 +2368,25 @@ local function killEsp(model)
 	esp[model] = nil
 end
 
-local function ensureEsp(model)
+local function ensureEsp(model, needBones)
 	local e = esp[model]
-	if e then return e end
+	if e then
+		-- lazily create bones only when skeleton is actually on
+		if needBones and not e.bones then
+			e.bones, e.boneOut, e.joints = {}, {}, {}
+			for i = 1, 16 do -- reduced from 28
+				e.boneOut[i] = line()
+				e.bones[i] = line()
+				e.joints[i] = dot()
+				e.boneOut[i].ZIndex = 31
+				e.bones[i].ZIndex = 32
+				table.insert(e.trash, e.boneOut[i])
+				table.insert(e.trash, e.bones[i])
+				table.insert(e.trash, e.joints[i])
+			end
+		end
+		return e
+	end
 	e = { trash = {} }
 	local function track(obj)
 		table.insert(e.trash, obj)
@@ -2161,18 +2423,46 @@ local function ensureEsp(model)
 	e.hp.AnchorPoint = Vector2.new(0, 0)
 	e.tracerOut = track(line())
 	e.tracer = track(line())
-	e.bones = {}
-	e.boneOut = {}
-	e.joints = {}
-	for i = 1, 28 do
-		e.boneOut[i] = track(line())
-		e.bones[i] = track(line())
-		e.joints[i] = track(dot())
-		e.boneOut[i].ZIndex = 31
-		e.bones[i].ZIndex = 32
+	-- bones created on demand only
+	e.bones, e.boneOut, e.joints = nil, nil, nil
+	if needBones then
+		e.bones, e.boneOut, e.joints = {}, {}, {}
+		for i = 1, 16 do
+			e.boneOut[i] = track(line())
+			e.bones[i] = track(line())
+			e.joints[i] = track(dot())
+			e.boneOut[i].ZIndex = 31
+			e.bones[i].ZIndex = 32
+		end
 	end
 	esp[model] = e
 	return e
+end
+
+-- Lightweight grave / object labels (no boxes/bones)
+local lightLabels = {}
+local function ensureLight(key)
+	local l = lightLabels[key]
+	if l and l.Parent then return l end
+	l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Font = FONT
+	l.TextSize = 13
+	l.TextStrokeTransparency = 0
+	l.TextStrokeColor3 = Color3.new(0, 0, 0)
+	l.TextXAlignment = Enum.TextXAlignment.Center
+	l.Size = UDim2.fromOffset(240, 16)
+	l.AnchorPoint = Vector2.new(0.5, 0.5)
+	l.Visible = false
+	l.ZIndex = 33
+	l.Active = false
+	l.Parent = overlay
+	lightLabels[key] = l
+	return l
+end
+local function hideLight(key)
+	local l = lightLabels[key]
+	if l then l.Visible = false end
 end
 
 local function hideEsp(e)
@@ -2338,6 +2628,74 @@ end
 local watched = {}
 local lastShot = 0
 local damaged = {}
+local lastHitPart = {}   -- model -> "Head" / "Body" / "Limb"
+local lastHitDist = {}   -- model -> studs
+local lastHitGun = {}    -- model -> weapon name
+local deathLogged = {}
+
+local function myGunName()
+	local cam = workspace.CurrentCamera
+	if cam then
+		local vm = cam:FindFirstChild("CurrentWeapon")
+		if vm and vm.Name ~= "" and vm.Name ~= "CurrentWeapon" then return vm.Name end
+		if vm then
+			for _, d in ipairs(vm:GetChildren()) do
+				if (d:IsA("Model") or d:IsA("MeshPart") or d:IsA("Tool")) and d.Name ~= "" and #d.Name < 28 then
+					local n = d.Name:lower()
+					if not n:find("arm", 1, true) and not n:find("hand", 1, true) and not n:find("camera", 1, true) then
+						return d.Name
+					end
+				end
+			end
+		end
+	end
+	local char = lp.Character
+	if char then
+		local tool = char:FindFirstChildOfClass("Tool")
+		if tool and tool.Name ~= "" then return tool.Name end
+	end
+	return "Gun"
+end
+
+local function partZone(partName)
+	local n = (partName or ""):lower()
+	if n:find("head", 1, true) or n:find("helmet", 1, true) or n:find("skull", 1, true) or n:find("face", 1, true) then
+		return "Head"
+	end
+	if n:find("torso", 1, true) or n:find("chest", 1, true) or n:find("spine", 1, true)
+		or n:find("pelvis", 1, true) or n:find("hip", 1, true) or n:find("stomach", 1, true) then
+		return "Body"
+	end
+	if n:find("arm", 1, true) or n:find("hand", 1, true) or n:find("leg", 1, true)
+		or n:find("foot", 1, true) or n:find("thigh", 1, true) then
+		return "Limb"
+	end
+	return "Body"
+end
+
+local function victimName(info, model)
+	if info then
+		if info.plr and typeof(info.plr) == "Instance" and info.plr:IsA("Player") then
+			local n = labelOf(info.plr, info.plr.UserId)
+			if n and n ~= "" and n ~= "Player" then return n end
+		end
+		if info.name and info.name ~= "" and info.name ~= "Player" and not tostring(info.name):match("^P%d+$") then
+			return info.name
+		end
+		if info.uid then
+			local n = labelOf(nil, info.uid)
+			if n and n ~= "" then return n end
+		end
+	end
+	if model then
+		local plr = playerOf(model)
+		if plr then
+			local n = labelOf(plr, plr.UserId)
+			if n and n ~= "" then return n end
+		end
+	end
+	return (info and info.chinese and "Chinese") or "Zombie"
+end
 
 local function watchModel(model, info)
 	if watched[model] then return end
@@ -2349,30 +2707,117 @@ local function watchModel(model, info)
 	connect(hum.HealthChanged, function(h)
 		local dmg = last - h
 		last = h
-		if dmg > 0.5 and os.clock() - lastShot < 0.8 then
+		if dmg > 0.5 and os.clock() - lastShot < 1.2 then
 			damaged[model] = os.clock()
 			playHit()
 		end
 	end)
 	connect(hum.Died, function()
-		if not damaged[model] or os.clock() - damaged[model] > 8 then return end
-		local who = info.plr and info.plr.DisplayName or model.Name
-		local verb = "killed"
-		if not on("Environment", "Logs", "Use Default Kill Words") then
-			local raw = flag("txt", "Environment", "Logs", "word1, word2, word3...")
-			if type(raw) == "string" and raw ~= "" then
-				local words = {}
-				for w in raw:gmatch("[^,%s]+") do table.insert(words, w) end
-				if #words > 0 then verb = words[math.random(1, #words)] end
+		if deathLogged[model] then return end
+		deathLogged[model] = true
+		local who = victimName(info, model)
+		local myKill = damaged[model] and (os.clock() - damaged[model] < 10)
+		if myKill then
+			local gun = lastHitGun[model] or myGunName()
+			local zone = lastHitPart[model] or "Body"
+			local distM = lastHitDist[model] and toMeters(lastHitDist[model]) or "?"
+			local verb = "killed"
+			if not on("Environment", "Logs", "Use Default Kill Words") then
+				local raw = flag("txt", "Environment", "Logs", "word1, word2, word3...")
+				if type(raw) == "string" and raw ~= "" then
+					local words = {}
+					for w in raw:gmatch("[^,%s]+") do table.insert(words, w) end
+					if #words > 0 then verb = words[math.random(1, #words)] end
+				end
 			end
+			pushLog(string.format("%s %s  [%s]  %s  %sm", verb, who, gun, zone, tostring(distM)))
+		elseif on("Environment", "Logs", "Kill Logs") then
+			-- anyone else dying in range
+			local cam = workspace.CurrentCamera
+			local root = info.root
+			local distM = "?"
+			if cam and root then
+				distM = toMeters((root.Position - cam.CFrame.Position).Magnitude)
+			end
+			pushLog(string.format("%s died  %sm", who, tostring(distM)))
 		end
-		pushLog(verb .. " " .. who)
 	end)
 end
 
+-- Global death feed: catch ANY humanoid death, not only ones we damaged
+local globalDeathHooked = setmetatable({}, { __mode = "k" })
+local function hookDeath(hum, model)
+	if not hum or globalDeathHooked[hum] then return end
+	if typeof(hum) ~= "Instance" then return end
+	globalDeathHooked[hum] = true
+	pcall(function()
+		connect(hum.Died, function()
+			if not on("Environment", "Logs", "Kill Logs") then return end
+			if deathLogged[model] then return end
+			deathLogged[model] = true
+			local info = humans[model]
+			local who = victimName(info, model)
+			local myKill = damaged[model] and (os.clock() - damaged[model] < 10)
+			local cam = workspace.CurrentCamera
+			local root = (info and info.root) or (model and (model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model.PrimaryPart))
+			local distM = "?"
+			if cam and root then
+				distM = toMeters((root.Position - cam.CFrame.Position).Magnitude)
+			end
+			if myKill then
+				local gun = lastHitGun[model] or myGunName()
+				local zone = lastHitPart[model] or "Body"
+				local d = lastHitDist[model] and toMeters(lastHitDist[model]) or distM
+				local verb = "killed"
+				if not on("Environment", "Logs", "Use Default Kill Words") then
+					local raw = flag("txt", "Environment", "Logs", "word1, word2, word3...")
+					if type(raw) == "string" and raw ~= "" then
+						local words = {}
+						for w in raw:gmatch("[^,%s]+") do table.insert(words, w) end
+						if #words > 0 then verb = words[math.random(1, #words)] end
+					end
+				end
+				pushLog(string.format("%s %s  [%s]  %s  %sm", verb, who, gun, zone, tostring(d)))
+			else
+				pushLog(string.format("%s died  %sm", who, tostring(distM)))
+			end
+			-- promote corpse to grave ESP with real name
+			if model and model.Parent and who and who ~= "Zombie" then
+				graves[model] = who
+			end
+		end)
+	end)
+end
+
+-- Hook existing + new humanoids for death feed
+task.spawn(function()
+	while gui.Parent do
+		if on("Environment", "Logs", "Kill Logs") then
+			for model, info in pairs(humans) do
+				if info.hum and typeof(info.hum) == "Instance" then
+					hookDeath(info.hum, model)
+				end
+			end
+			-- also scan entities folder for any humanoid we might have missed
+			local assets = workspace:FindFirstChild("game_assets")
+			local entities = assets and assets:FindFirstChild("Entities")
+			if entities then
+				for _, m in ipairs(entities:GetChildren()) do
+					if m:IsA("Model") then
+						local hum = m:FindFirstChildOfClass("Humanoid") or m:FindFirstChildWhichIsA("Humanoid", true)
+						if hum then hookDeath(hum, m) end
+					end
+				end
+			end
+		end
+		task.wait(1.2)
+	end
+end)
+
 connect(UIS.InputBegan, function(input)
 	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-	if not on("Environment", "Logs", "Kill Logs") and not on("Environment", "Logs", "Hit Logs") then return end
+	lastShot = os.clock()
+	if not on("Environment", "Logs", "Kill Logs") and not on("Combat", "Miscellaneous", "Hit Sounds") then return end
 	local cam = workspace.CurrentCamera
 	if not cam then return end
 	local params = RaycastParams.new()
@@ -2383,7 +2828,7 @@ connect(UIS.InputBegan, function(input)
 	local view = cam:FindFirstChild("CurrentWeapon")
 	if view then table.insert(ignore, view) end
 	params.FilterDescendantsInstances = ignore
-	local hit = workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 800, params)
+	local hit = workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 1200, params)
 	if not hit then return end
 	local model = hit.Instance:FindFirstAncestorOfClass("Model")
 	if not model or model == me then return end
@@ -2391,9 +2836,16 @@ connect(UIS.InputBegan, function(input)
 	local assets = workspace:FindFirstChild("game_assets")
 	local entities = assets and assets:FindFirstChild("Entities")
 	if not info and not (entities and model:IsDescendantOf(entities)) then return end
-	local who = (info and info.plr and info.plr.DisplayName) or "Zombie"
-	local dist = math.floor((hit.Position - cam.CFrame.Position).Magnitude)
-	pushLog(string.format("hit %s  %dm", who, dist))
+	local who = victimName(info, model)
+	local dist = (hit.Position - cam.CFrame.Position).Magnitude
+	local zone = partZone(hit.Instance.Name)
+	lastHitPart[model] = zone
+	lastHitDist[model] = dist
+	lastHitGun[model] = myGunName()
+	damaged[model] = os.clock()
+	if on("Environment", "Logs", "Kill Logs") then
+		pushLog(string.format("hit %s  %s  %sm", who, zone, tostring(toMeters(dist))))
+	end
 end)
 
 -- aim state
@@ -2720,6 +3172,21 @@ local vmBase = {}
 local savedAuto = true
 local staticYaw
 local aaOn = false
+local aaMotorOrig = {}
+local aaGyro = nil
+
+local function restoreAaMotors()
+	for motor, orig in pairs(aaMotorOrig) do
+		pcall(function()
+			if motor.Parent then motor.Transform = orig end
+		end)
+	end
+	aaMotorOrig = {}
+	if aaGyro then
+		pcall(function() aaGyro:Destroy() end)
+		aaGyro = nil
+	end
+end
 
 local function stopFly()
 	if flyV then flyV:Destroy() flyV = nil end
@@ -2893,10 +3360,17 @@ local function sweepFoliage()
 	static = static and static:FindFirstChild("StaticObjects")
 	local treeFolder = static and static:FindFirstChild("Trees")
 	if not treeFolder then return end
-	if foliageReady and #leafCache > 0 then return end
+	-- Re-scan if cache is empty or majority of entries are destroyed (happens after death/respawn)
+	local alive = 0
+	for i = 1, math.min(#leafCache, 30) do
+		local p = leafCache[i]
+		if p and p.Parent then alive = alive + 1 end
+	end
+	if foliageReady and #leafCache > 0 and alive > 5 then return end
 	foliageReady = true
 	table.clear(leafCache)
 	table.clear(grassCache)
+	leafCursor = 1
 	local function consider(inst, into, words)
 		local n = inst.Name:lower()
 		for _, w in ipairs(words) do
@@ -2914,6 +3388,15 @@ local function sweepFoliage()
 		for _, p in ipairs(tree:GetChildren()) do
 			consider(p, leafCache, { "leaf", "leaves", "canopy", "frond", "bush" })
 			consider(p, grassCache, { "grass", "weed" })
+		end
+		-- also deep scan a bit for nested leaf meshes
+		for _, p in ipairs(tree:GetDescendants()) do
+			if p:IsA("BasePart") or p:IsA("MeshPart") then
+				local nn = p.Name:lower()
+				if nn:find("leaf", 1, true) or nn:find("leaves", 1, true) or nn:find("canopy", 1, true) or nn:find("frond", 1, true) then
+					table.insert(leafCache, p)
+				end
+			end
 		end
 	end
 	for _, folder in ipairs(static:GetChildren()) do
@@ -3074,6 +3557,7 @@ local SPECIAL = {
 	"awm", "mrad", "m82", "mk-14", "mk14", "m110", "svd", "pkm", "m249",
 	"as-val", "asval", "honey badger", "scar", "mk-18", "mk18", "fal", "saiga",
 	"altyn", "nvg", "night vision", "floppy", "ghillie",
+	"barret", "barrett", "m107", "attackbag", "attack bag", "attack_bag",
 }
 
 bindButton("Scan Server", function()
@@ -3305,6 +3789,29 @@ bindButton("Scan Special Weapons", function()
 	end
 end)
 
+bindButton("Dump Nearby Models", function()
+	local cam = workspace.CurrentCamera
+	if not cam then return notify("No camera.", false) end
+	local origin = cam.CFrame.Position
+	local best = {}
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("Model") and d.Name ~= "PlayerGrave" then
+			local part = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart")
+			if part then
+				local dist = (part.Position - origin).Magnitude
+				if dist < 80 then
+					table.insert(best, { dist, (d.Parent and d.Parent.Name or "?") .. " / " .. d.Name .. "  " .. math.floor(dist) .. "m" })
+				end
+			end
+		end
+	end
+	table.sort(best, function(a, b) return a[1] < b[1] end)
+	if #best == 0 then return notify("No models within 80m.", false) end
+	local lines = {}
+	for i = 1, math.min(8, #best) do lines[i] = best[i][2] end
+	notify(table.concat(lines, "\n"), true)
+end)
+
 bindButton("Remove Vehicle Colliders", function()
 	local n = 0
 	for _, d in ipairs(workspace:GetDescendants()) do
@@ -3524,13 +4031,16 @@ pcall(function()
 		end
 		if on("Environment", "World Modifications", "No Grass") then
 			pcall(function() workspace.Terrain.Decoration = false end)
-			if not foliageReady then task.spawn(sweepFoliage) end
+			if not foliageReady or #grassCache == 0 then task.spawn(sweepFoliage) end
 			local count = #grassCache
 			if count > 0 then
 				for i = 1, count do
 					local p = grassCache[i]
 					if p and p.Parent then
 						pcall(function()
+							if transOrig[p] == nil then
+								transOrig[p] = p.LocalTransparencyModifier
+							end
 							p.LocalTransparencyModifier = 1
 							if p:IsA("BasePart") then p.Transparency = 1 end
 						end)
@@ -3539,16 +4049,24 @@ pcall(function()
 			end
 		end
 		if on("Environment", "World Modifications", "No Trees") then
-			if not foliageReady then task.spawn(sweepFoliage) end
+			if not foliageReady or #leafCache == 0 then task.spawn(sweepFoliage) end
 			local count = #leafCache
 			if count > 0 then
-				for _ = 1, math.min(200, count) do
+				for _ = 1, math.min(400, count) do
 					local p = leafCache[leafCursor]
 					leafCursor = leafCursor % count + 1
 					if p and p.Parent then
 						pcall(function()
+							if transOrig[p] == nil then
+								if p:IsA("BasePart") then
+									transOrig[p] = p.LocalTransparencyModifier
+								elseif p:IsA("Decal") or p:IsA("Texture") then
+									transOrig[p] = p.Transparency
+								end
+							end
 							p.LocalTransparencyModifier = 1
 							if p:IsA("BasePart") then p.Transparency = 1 end
+							if p:IsA("Decal") or p:IsA("Texture") then p.Transparency = 1 end
 						end)
 					end
 				end
@@ -3632,11 +4150,18 @@ pcall(function()
 end)
 
 local function applyAntiAim(dt)
-	local model, root = myBody()
+	local spinning = on("Combat", "Target Settings", "Spin-Bot")
+	local anti = on("Combat", "Miscellaneous", "Anti Aim")
+	local model, root = ownBody()
+	if not model or not root then
+		local c, _, r = myChar()
+		model, root = c, r
+	end
 	if not model or not root then
 		if aaOn then
 			aaOn = false
 			staticYaw = nil
+			restoreAaMotors()
 		end
 		return
 	end
@@ -3646,16 +4171,16 @@ local function applyAntiAim(dt)
 			pcall(function() hum.AutoRotate = savedAuto end)
 			aaOn = false
 			staticYaw = nil
+			restoreAaMotors()
 		end
 		return
 	end
-	local spinning = on("Combat", "Target Settings", "Spin-Bot")
-	local anti = on("Combat", "Miscellaneous", "Anti Aim")
 	if flyV or (not spinning and not anti) then
 		if aaOn then
-			pcall(function() hum.AutoRotate = savedAuto end)
+			pcall(function() if hum then hum.AutoRotate = savedAuto end end)
 			aaOn = false
 			staticYaw = nil
+			restoreAaMotors()
 		end
 		return
 	end
@@ -3735,9 +4260,41 @@ local function applyAntiAim(dt)
 		yaw = yaw + t * math.max(num("Combat", "Target Settings", "Spin-Bot Speed", 25), 1) * 0.2
 	end
 	local data = lp:FindFirstChild("CharData")
-	local yawVal = data and data:FindFirstChild("Yaw")
-	if yawVal and yawVal:IsA("NumberValue") then
-		yawVal.Value = yaw
+	local function pushYaw(inst)
+		if not inst then return end
+		for _, v in ipairs(inst:GetChildren()) do
+			if v:IsA("NumberValue") or v:IsA("IntValue") then
+				local n = v.Name:lower()
+				if n:find("yaw", 1, true) or n:find("facing", 1, true) or n:find("bodyrot", 1, true)
+					or n:find("rotation", 1, true) or n:find("look", 1, true) or n:find("angle", 1, true)
+					or n:find("orient", 1, true) or n:find("dir", 1, true) then
+					local useDeg = n:find("deg", 1, true) or math.abs(v.Value) > 6.5
+					v.Value = useDeg and math.deg(yaw) or yaw
+				end
+			end
+		end
+		pcall(function()
+			for name, val in pairs(inst:GetAttributes()) do
+				local n = tostring(name):lower()
+				if n:find("yaw", 1, true) or n:find("facing", 1, true) or n:find("rot", 1, true) then
+					local useDeg = n:find("deg", 1, true) or (type(val) == "number" and math.abs(val) > 6.5)
+					inst:SetAttribute(name, useDeg and math.deg(yaw) or yaw)
+				end
+			end
+		end)
+	end
+	pushYaw(data)
+	pushYaw(model)
+	if data then
+		for _, child in ipairs(data:GetDescendants()) do
+			if child:IsA("NumberValue") or child:IsA("IntValue") then
+				local n = child.Name:lower()
+				if n:find("yaw", 1, true) or n:find("facing", 1, true) or n:find("body", 1, true) then
+					local useDeg = n:find("deg", 1, true) or math.abs(child.Value) > 6.5
+					child.Value = useDeg and math.deg(yaw) or yaw
+				end
+			end
+		end
 	end
 	local function pitchJoint(d, angle, lift)
 		local n = d.Name:lower()
@@ -3753,31 +4310,49 @@ local function applyAntiAim(dt)
 		end
 	end
 	local body = model
-	if body and (spinning or anti) and mode ~= "sky" then
-		pcall(function()
-			local cf = body:GetPivot()
-			body:PivotTo(CFrame.new(cf.Position) * CFrame.Angles(0, yaw, 0))
-		end)
+	local savedCam = cam and cam.CFrame
+	-- Only force yaw by default so the body doesn't pop upward for a frame
+	local usePitch = pitch
+	if mode ~= "up" and mode ~= "sky" and mode ~= "down" and mode ~= "zero" then
+		local curPitch = select(1, root.CFrame:ToOrientation())
+		usePitch = curPitch
 	end
+	local targetCF = CFrame.new(root.Position) * CFrame.fromOrientation(usePitch, yaw, 0)
+	-- Force the orientation every frame + BodyGyro so it fights the character controller
+	pcall(function()
+		root.CFrame = targetCF
+		if body.PrimaryPart then
+			body:SetPrimaryPartCFrame(targetCF)
+		end
+		body:PivotTo(targetCF)
+		root.AssemblyAngularVelocity = Vector3.new(0, root.AssemblyAngularVelocity.Y * 0.2, 0)
+		if not aaGyro or aaGyro.Parent ~= root then
+			if aaGyro then pcall(function() aaGyro:Destroy() end) end
+			aaGyro = Instance.new("BodyGyro")
+			aaGyro.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
+			aaGyro.P = 3e4
+			aaGyro.D = 1e3
+			aaGyro.Parent = root
+		end
+		aaGyro.CFrame = targetCF
+	end)
+	if cam and savedCam then cam.CFrame = savedCam end
 	if body and on("Combat", "Target Settings", "Long Neck") then
 		local lift = math.clamp(num("Combat", "Target Settings", "Long Neck Value", 5), 0, 6)
 		for _, d in ipairs(body:GetDescendants()) do
 			pitchJoint(d, 0, lift * 0.35)
 		end
 	end
-	if anti and mode == "sky" then
-		local saved = workspace.CurrentCamera and workspace.CurrentCamera.CFrame
-		local function rig(model)
-			if not model then return end
-			for _, d in ipairs(model:GetDescendants()) do
+	if anti and (mode == "sky" or mode == "up") then
+		local function rig(host)
+			if not host then return end
+			for _, d in ipairs(host:GetDescendants()) do
 				pitchJoint(d, -1.15, 0)
 			end
 		end
 		rig(body)
-		rig(workspace.CurrentCamera and workspace.CurrentCamera:FindFirstChild("CurrentWeapon"))
-		if workspace.CurrentCamera and saved then
-			workspace.CurrentCamera.CFrame = saved
-		end
+		rig(cam and cam:FindFirstChild("CurrentWeapon"))
+		if cam and savedCam then cam.CFrame = savedCam end
 	end
 end
 
@@ -3786,13 +4361,14 @@ pcall(function()
 		if on("Environment", "World Modifications", "No Grass") then
 			pcall(function() workspace.Terrain.Decoration = false end)
 		end
-		applyAntiAim(0)
+		pcall(applyAntiAim, 0)
 	end)
 end)
 
 pcall(function()
 	pcall(function()
 	RunService:BindToRenderStep("XyroBodyCham", 2000000000, function()
+		pcall(applyAntiAim, 0)
 		if chamBody and chamBody.Parent then
 			paintLimbs(chamBody, true, chamBodyColor, chamBodyMat)
 		end
@@ -3905,6 +4481,7 @@ connect(RunService.RenderStepped, function(dt)
 	local espTeam = on("Visuals", "Player ESP", "Team Check")
 	local maxEsp = num("Visuals", "Player ESP", "ESP Max Distance", 3000) / STUD_TO_M
 	local textSize = num("Visuals", "Object ESP", "Text Size", 13)
+	_G.__xyroSkelSkip = (_G.__xyroSkelSkip or 0) - 1
 
 	local liveReps = {}
 	local function addLive(part, plr, shown, pos, uid)
@@ -4043,7 +4620,13 @@ connect(RunService.RenderStepped, function(dt)
 
 	local seen = {}
 	local me = select(1, localEntity())
+	local drawnHumans = 0
+	local MAX_DRAW = 28 -- hard cap so ESP can't melt FPS
 	for model, info in pairs(humans) do
+		if drawnHumans >= MAX_DRAW then
+			if esp[model] and not seen[model] then hideEsp(esp[model]) end
+			continue
+		end
 		if model == me or model:IsDescendantOf(Camera) or (info.root and model:FindFirstChild("UpperTorso") and (info.root.Position - Camera.CFrame.Position).Magnitude < 18) then
 			if esp[model] then hideEsp(esp[model]) end
 			continue
@@ -4064,27 +4647,67 @@ connect(RunService.RenderStepped, function(dt)
 			colr = swatch("Visuals", "Player ESP", "Boxes", WHITE)
 			local resolvedName = nearName
 			if not resolvedName or resolvedName == "" or resolvedName == "..." or resolvedName == "Player" then
-				resolvedName = plr and labelOf(plr, plr.UserId)
+				resolvedName = plr and labelOf(plr, typeof(plr) == "Instance" and plr.UserId)
+			end
+			if (not resolvedName or resolvedName == "" or resolvedName == "..." or resolvedName == "Player") and info.uid then
+				resolvedName = labelOf(nil, info.uid)
 			end
 			if not resolvedName or resolvedName == "" or resolvedName == "..." or resolvedName == "Player" then
 				resolvedName = usernameAt(info.root and info.root.Position)
+			end
+			-- last resort: try matching any nearby player by position
+			if (not resolvedName or resolvedName == "" or resolvedName == "..." or resolvedName == "Player") and info.root then
+				local bestPlr, bestD
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p ~= lp and p.Character then
+						local r = p.Character:FindFirstChild("HumanoidRootPart") or p.Character:FindFirstChild("Torso") or p.Character.PrimaryPart
+						if r then
+							local d = (r.Position - info.root.Position).Magnitude
+							if d < 12 and (not bestD or d < bestD) then
+								bestD, bestPlr = d, p
+							end
+						end
+					end
+				end
+				if bestPlr then
+					resolvedName = labelOf(bestPlr, bestPlr.UserId)
+					info.plr = bestPlr
+				end
 			end
 			if resolvedName == "..." or resolvedName == "Player" then resolvedName = nil end
 			if resolvedName and resolvedName ~= "" then
 				tag = resolvedName
 				info.name = resolvedName
 			elseif not tag or tag == "" or tag:match("^{[%x%-]+}$") then
-				local uid = (plr and plr.UserId) or info.uid
+				local uid = (plr and typeof(plr) == "Instance" and plr.UserId) or info.uid
 				if uid and namePending[uid] then
 					tag = "..."
 				else
-					if not _G.__xyroIds then _G.__xyroIds = {} end
-					if not _G.__xyroIds[model] then
-						_G.__xyroIds._n = (_G.__xyroIds._n or 0) + 1
-						_G.__xyroIds[model] = "P" .. _G.__xyroIds._n
+					-- Prefer real player list index over P#
+					local idx
+					for i, p in ipairs(Players:GetPlayers()) do
+						if p ~= lp then
+							idx = (idx or 0) + 1
+							if (plr and plr == p) or (uid and p.UserId == uid) then
+								tag = p.Name ~= "" and p.Name or ("Player" .. idx)
+								break
+							end
+						end
 					end
-					tag = _G.__xyroIds[model]
+					if not tag or tag == "" or tag:match("^{[%x%-]+}$") then
+						if not _G.__xyroIds then _G.__xyroIds = {} end
+						if not _G.__xyroIds[model] then
+							_G.__xyroIds._n = (_G.__xyroIds._n or 0) + 1
+							_G.__xyroIds[model] = "P" .. _G.__xyroIds._n
+						end
+						tag = _G.__xyroIds[model]
+					end
 				end
+			end
+			-- Append held weapon
+			local gun = heldWeapon(model)
+			if gun and gun ~= "" then
+				tag = tag .. " [" .. gun .. "]"
 			end
 		elseif rig == "zombie" then
 			if info.chinese then
@@ -4117,7 +4740,8 @@ connect(RunService.RenderStepped, function(dt)
 		end
 		if want and dist <= maxEsp then
 			seen[model] = true
-			local e = ensureEsp(model)
+			drawnHumans += 1
+			local e = ensureEsp(model, false)
 			local head = aimPart(model, "Head") or info.root
 			if head and info.root and (head.Position - info.root.Position).Magnitude > 14 then
 				hideEsp(ensureEsp(model))
@@ -4209,11 +4833,14 @@ connect(RunService.RenderStepped, function(dt)
 					e.tracerOut.Visible = false
 				end
 				local skOn = on("Visuals", "Player ESP", "Skeleton")
-				if skOn then
+				if skOn and (not _G.__xyroSkelSkip or _G.__xyroSkelSkip <= 0) then
+					_G.__xyroSkelSkip = 2 -- every 3rd frame
+					e = ensureEsp(model, true) -- ensure bone frames exist
 					local bones = boneList(model)
 					local scol = swatch("Visuals", "Player ESP", "Skeleton", WHITE)
-					local limit = math.clamp(math.max(h, 18) * 1.4, 18, 220)
-					for i = 1, 28 do
+					local limit = math.clamp(math.max(h, 18) * 1.4, 18, 180)
+					local maxB = e.bones and #e.bones or 0
+					for i = 1, maxB do
 						local pair = bones[i]
 						local a = pair and worldToScreen(pair[1].Position)
 						local b = pair and worldToScreen(pair[2].Position)
@@ -4225,13 +4852,13 @@ connect(RunService.RenderStepped, function(dt)
 							e.bones[i].Visible = false
 							e.boneOut[i].Visible = false
 						end
-						e.joints[i].Visible = false
+						if e.joints[i] then e.joints[i].Visible = false end
 					end
-				else
-					for i = 1, 28 do
+				elseif e.bones then
+					for i = 1, #e.bones do
 						e.bones[i].Visible = false
 						e.boneOut[i].Visible = false
-						e.joints[i].Visible = false
+						if e.joints[i] then e.joints[i].Visible = false end
 					end
 				end
 				local isPlayer = rig == "player"
@@ -4239,7 +4866,6 @@ connect(RunService.RenderStepped, function(dt)
 					or ((not isPlayer) and (on("Visuals", "Zombie ESP", "Zombie Chams") or on("Visuals", "Chams", "Player Chams")))
 				if wantCham then
 					local mode = pick("Visuals", "Chams", "Chams Mode", "Always On Top")
-					local inten = num("Visuals", "Chams", "Chams Intensity", 55) / 100
 					local col = isPlayer and swatch("Visuals", "Player ESP", "Chams", MAGENTA) or swatch("Visuals", "Zombie ESP", "Zombie Chams", RED)
 					chamHL[model] = ensureHL(chamHL[model], model, col, col)
 					local hl = chamHL[model]
@@ -4253,12 +4879,14 @@ connect(RunService.RenderStepped, function(dt)
 						hl.Adornee = model
 						hl.Enabled = true
 					end
-					if mode ~= "Outline Only" then
-						paintModel(model, model, true, col, "ForceField", isLimb)
+					-- paintModel is expensive; only run it occasionally to cut frame time
+					if mode ~= "Outline Only" and (not _G.__xyroChamAt or os.clock() > _G.__xyroChamAt) then
+						_G.__xyroChamAt = os.clock() + 0.35
+						pcall(paintModel, model, model, true, col, "ForceField", isLimb)
 					end
 				else
 					if chamHL[model] then chamHL[model].Enabled = false end
-					paintModel(model, model, false)
+					pcall(paintModel, model, model, false)
 				end
 			else
 				hideEsp(e)
@@ -4270,12 +4898,7 @@ connect(RunService.RenderStepped, function(dt)
 	for model in pairs(chamHL) do
 		if not seen[model] and chamHL[model] then
 			chamHL[model].Enabled = false
-			paintModel(model, model, false)
-		end
-	end
-	for model in pairs(esp) do
-		if not seen[model] and humans[model] == nil and worldObjs[model] == nil and graves[model] == nil then
-			hideEsp(esp[model])
+			pcall(paintModel, model, model, false)
 		end
 	end
 
@@ -4333,76 +4956,100 @@ connect(RunService.RenderStepped, function(dt)
 	end
 
 	if on("Visuals", "Player ESP", "Grave ESP") then
+		local graveCol = swatch("Visuals", "Player ESP", "Grave ESP", Color3.fromRGB(190, 190, 190))
+		local graveN = 0
 		for model, who in pairs(graves) do
-			if not model.Parent then
+			if not model or not model.Parent then
 				graves[model] = nil
+				hideLight(model)
 				if esp[model] then hideEsp(esp[model]) end
 			else
-				local part = model:FindFirstChild("Torso") or model:FindFirstChild("Head") or model:FindFirstChildWhichIsA("BasePart")
-				local sp = part and worldToScreen(part.Position)
-				if sp then
-					local e = ensureEsp(model)
-					seen[model] = true
-					for i = 1, 4 do
-						e.box[i].Visible = false
-						e.boxOut[i].Visible = false
+				graveN += 1
+				if graveN > 40 then
+					hideLight(model)
+				else
+					local part = model:FindFirstChild("Torso") or model:FindFirstChild("Head")
+						or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+					if not part or not part.Parent then
+						hideLight(model)
+					else
+						local dist = (part.Position - Camera.CFrame.Position).Magnitude
+						if dist > maxEsp then
+							hideLight(model)
+						else
+							local sp = worldToScreen(part.Position)
+							if sp then
+								local label = tostring(who or "Unknown")
+								if label == "" or label == "Player" or label == "Grave" then label = "Unknown" end
+								local l = ensureLight(model)
+								l.Text = label .. "  body  " .. toMeters(dist) .. "m"
+								l.TextColor3 = graveCol
+								l.TextSize = textSize
+								l.Position = UDim2.fromOffset(sp.X, sp.Y)
+								l.Visible = true
+								seen[model] = true
+							else
+								hideLight(model)
+							end
+						end
 					end
-					e.hp.Visible = false
-					e.hpBack.Visible = false
-					e.tracer.Visible = false
-					e.tracerOut.Visible = false
-					e.name.Visible = true
-					e.name.Text = who .. "  body"
-					e.name.TextColor3 = Color3.fromRGB(190, 190, 190)
-					e.name.TextSize = textSize
-					e.name.Position = UDim2.fromOffset(sp.X, sp.Y)
-				elseif esp[model] then
-					hideEsp(esp[model])
 				end
 			end
 		end
+	else
+		for model in pairs(graves) do
+			hideLight(model)
+			if esp[model] then hideEsp(esp[model]) end
+		end
 	end
 
-	-- object esp labels (rebuilt lightly)
+	-- object esp labels — lightweight only
+	local objMax = 900
+	local objN = 0
 	for inst, info in pairs(worldObjs) do
-		if not inst.Parent or not info.part.Parent then
+		if not inst.Parent or not info.part or not info.part.Parent or isBadWorld(inst.Name) or isWreck(inst) then
 			worldObjs[inst] = nil
+			hideLight(inst)
 			if esp[inst] then killEsp(inst) end
 		else
 			local kind = info.kind
 			local enabled = (kind == "item" and on("Visuals", "Object ESP", "Item ESP"))
 				or (kind == "vehicle" and on("Visuals", "Object ESP", "Vehicle ESP"))
 				or (kind == "container" and on("Visuals", "Object ESP", "Container ESP"))
-				or (kind == "grave" and on("Visuals", "Player ESP", "Grave ESP"))
-			local sp = enabled and worldToScreen(info.part.Position)
+			local dist = (info.part.Position - Camera.CFrame.Position).Magnitude
+			objN += 1
+			local sp = (enabled and dist <= objMax and objN <= 50) and worldToScreen(info.part.Position)
 			if sp then
-				local e = ensureEsp(inst)
-				for i = 1, 4 do
-					e.box[i].Visible = false
-					e.boxOut[i].Visible = false
-				end
-				e.hp.Visible = false
-				e.hpBack.Visible = false
-				e.tracer.Visible = false
-				e.tracerOut.Visible = false
-				e.dist.Visible = false
-				e.name.Visible = true
 				local colr = kind == "item" and swatch("Visuals", "Object ESP", "Item ESP", PALETTE[6])
 					or kind == "vehicle" and swatch("Visuals", "Object ESP", "Vehicle ESP", PALETTE[4])
 					or swatch("Visuals", "Object ESP", "Container ESP", WHITE)
-				local d = math.floor((info.part.Position - Camera.CFrame.Position).Magnitude)
-				e.name.Text = inst.Name .. "  " .. d .. "m"
-				e.name.TextColor3 = colr
-				e.name.TextSize = textSize
-				e.name.Position = UDim2.fromOffset(sp.X, sp.Y)
-			elseif esp[inst] then
-				hideEsp(esp[inst])
+				local l = ensureLight(inst)
+				l.Text = inst.Name .. "  " .. toMeters(dist) .. "m"
+				l.TextColor3 = colr
+				l.TextSize = textSize
+				l.Position = UDim2.fromOffset(sp.X, sp.Y)
+				l.Visible = true
+				seen[inst] = true
+			else
+				hideLight(inst)
 			end
 		end
 	end
+	-- cleanup full ESP entries not drawn this frame
 	for key, e in pairs(esp) do
-		if not humans[key] and not worldObjs[key] then
+		if not seen[key] then
 			hideEsp(e)
+			if not humans[key] and not worldObjs[key] and not graves[key] then
+				if not (key and typeof(key) == "Instance" and key.Parent) then
+					killEsp(key)
+				end
+			end
+		end
+	end
+	-- cleanup light labels not seen
+	for key, l in pairs(lightLabels) do
+		if not seen[key] and l then
+			l.Visible = false
 		end
 	end
 
@@ -4699,7 +5346,7 @@ connect(RunService.RenderStepped, function(dt)
 		end
 	end
 
-	applyAntiAim(dt)
+	pcall(applyAntiAim, dt)
 
 	-- keybind list
 	local showKb = on("Visuals", "Extras", "Keybind List")
@@ -4808,7 +5455,7 @@ connect(RunService.Heartbeat, function(dt)
 		end
 
 		-- spin bot / anti aim. Runs again on render so the character script can't turn it back.
-		applyAntiAim(dt)
+		pcall(applyAntiAim, dt)
 
 		if on("Combat", "Miscellaneous", "No Impact Damage") then
 			hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
@@ -4931,12 +5578,33 @@ connect(RunService.Heartbeat, function(dt)
 		pcall(function() workspace.Terrain.Decoration = false end)
 	end
 	if on("Environment", "World Modifications", "No Trees") or on("Environment", "World Modifications", "No Grass") then
-		if not _G.__xyroFoliageAt or os.clock() > _G.__xyroFoliageAt then
-			_G.__xyroFoliageAt = os.clock() + 2
+		-- Force re-scan when cache is empty or toggle was just turned back on
+		if not foliageReady or #leafCache == 0 or #grassCache == 0 then
 			task.spawn(sweepFoliage)
+		elseif not _G.__xyroFoliageAt or os.clock() > _G.__xyroFoliageAt then
+			_G.__xyroFoliageAt = os.clock() + 2
+			-- re-apply transparency in case the game restored leaves after death/stream
+			local treesOn = on("Environment", "World Modifications", "No Trees")
+			if treesOn then
+				for i = 1, math.min(#leafCache, 300) do
+					local p = leafCache[i]
+					if p and p.Parent then
+						pcall(function()
+							if transOrig[p] == nil then transOrig[p] = p.LocalTransparencyModifier end
+							p.LocalTransparencyModifier = 1
+							if p:IsA("BasePart") then p.Transparency = 1 end
+						end)
+					end
+				end
+			end
 		end
-	elseif next(transOrig) then
-		restoreWorld()
+	else
+		if foliageReady or next(transOrig) then
+			foliageReady = false
+			table.clear(leafCache)
+			table.clear(grassCache)
+			restoreWorld()
+		end
 	end
 
 	if on("Combat", "Miscellaneous", "No Beartrap Damage") then
